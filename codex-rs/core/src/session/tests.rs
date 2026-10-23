@@ -2522,6 +2522,82 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
     assert_eq!(expected, raw_history_items(&history));
 }
 
+#[test_case::test_case(false; "function")]
+#[test_case::test_case(true; "custom")]
+#[tokio::test]
+async fn incomplete_tool_call_rejection_survives_fresh_resume(custom: bool) {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let mut ctx = crate::stream_events_utils::HandleOutputCtx {
+        sess: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn_context)),
+        turn_store: Arc::new(codex_extension_api::ExtensionData::new(
+            turn_context.sub_id.clone(),
+        )),
+        tool_runtime: test_tool_runtime(Arc::clone(&session), turn_context),
+        defer_tool_dispatch: false,
+        cancellation_token: CancellationToken::new(),
+    };
+    let call = if custom {
+        json!({"type": "custom_tool_call", "call_id": "incomplete", "name": "record_effect", "input": "record", "status": "incomplete"})
+    } else {
+        json!({"type": "function_call", "call_id": "incomplete", "name": "record_effect", "arguments": "{}", "status": "incomplete"})
+    };
+    let result = crate::stream_events_utils::handle_output_item_done(
+        &mut ctx,
+        serde_json::from_value(call).expect("call"),
+        None,
+    )
+    .await
+    .expect("incomplete call handled");
+    assert!(result.tool_future.is_none());
+    session.flush_rollout().await.expect("flush rejection pair");
+    let initial_history = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read durable rejection pair");
+    let InitialHistory::Resumed(ref resumed) = initial_history else {
+        panic!("expected resumed history");
+    };
+    let persisted = resumed
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(envelope) => Some(envelope.item.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(persisted.len(), 2);
+    let original = serde_json::to_value(&persisted[0]).expect("persisted call");
+    assert_eq!(original["call_id"], "incomplete");
+    assert_eq!(original["status"], "incomplete");
+    let (call_id, output) = match &persisted[1] {
+        ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } if custom => (call_id.as_str(), output),
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            output,
+            ..
+        } if !custom => (call_id.as_str(), output),
+        other => panic!("incorrect durable output type: {other:?}"),
+    };
+    assert_eq!(call_id, "incomplete");
+    // The success flag is internal; the non-execution disposition must survive in the body.
+    assert_eq!(output.success, None);
+    assert_eq!(
+        output.text_content(),
+        Some("Tool call was not executed because its model output was incomplete.")
+    );
+    let (fresh_session, _) = make_session_and_context().await;
+    fresh_session.record_initial_history(initial_history).await;
+    assert_eq!(
+        raw_history_items(&fresh_session.clone_history().await),
+        persisted
+    );
+}
+
 #[tokio::test]
 async fn record_conversation_items_stamps_missing_turn_id_and_preserves_existing_turn_id() {
     let (session, turn_context) = make_session_and_context().await;

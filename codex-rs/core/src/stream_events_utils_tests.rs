@@ -35,6 +35,287 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Default)]
+struct IncompleteCallProbe {
+    dispatched: std::sync::atomic::AtomicUsize,
+    handled: std::sync::atomic::AtomicUsize,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    block: bool,
+}
+
+impl codex_extension_api::ToolLifecycleContributor for IncompleteCallProbe {
+    fn on_tool_dispatch(&self, _input: codex_extension_api::ToolDispatchInput<'_>) {
+        self.dispatched
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct IncompleteCallHandler {
+    probe: Arc<IncompleteCallProbe>,
+    custom: bool,
+}
+
+impl crate::tools::registry::ToolExecutor<crate::tools::context::ToolInvocation>
+    for IncompleteCallHandler
+{
+    fn tool_name(&self) -> codex_tools::ToolName {
+        codex_tools::ToolName::plain("record_effect")
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        if self.custom {
+            codex_tools::ToolSpec::Freeform(codex_tools::FreeformTool {
+                name: "record_effect".to_string(),
+                description: "Count local test invocations.".to_string(),
+                defer_loading: None,
+                format: codex_tools::FreeformToolFormat {
+                    r#type: "grammar".to_string(),
+                    syntax: "lark".to_string(),
+                    definition: "start: /.+/".to_string(),
+                },
+            })
+        } else {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: "record_effect".to_string(),
+                description: "Count local test invocations.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })
+        }
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _invocation: crate::tools::context::ToolInvocation,
+    ) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        crate::tools::context::ToolInvocation: 'a,
+    {
+        Box::pin(async move {
+            self.probe
+                .handled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.probe.started.notify_one();
+            if self.probe.block {
+                self.probe.release.notified().await;
+            }
+            Ok(
+                Box::new(crate::tools::context::FunctionToolOutput::from_text(
+                    "effect recorded".to_string(),
+                    Some(true),
+                )) as Box<dyn crate::tools::context::ToolOutput>,
+            )
+        })
+    }
+}
+
+impl crate::tools::registry::CoreToolRuntime for IncompleteCallHandler {
+    fn matches_kind(&self, payload: &crate::tools::context::ToolPayload) -> bool {
+        match payload {
+            crate::tools::context::ToolPayload::Custom { .. } => self.custom,
+            crate::tools::context::ToolPayload::Function { .. } => !self.custom,
+            _ => false,
+        }
+    }
+}
+
+async fn incomplete_call_context(
+    custom: bool,
+    block: bool,
+) -> (HandleOutputCtx, Arc<IncompleteCallProbe>) {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let probe = Arc::new(IncompleteCallProbe {
+        block,
+        ..Default::default()
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.tool_lifecycle_contributor(probe.clone());
+    session.services.extensions = Arc::new(extensions.build());
+    let handler = Arc::new(IncompleteCallHandler {
+        probe: Arc::clone(&probe),
+        custom,
+    }) as Arc<dyn crate::tools::registry::CoreToolRuntime>;
+    let router = Arc::new(ToolRouter::from_parts(
+        crate::tools::registry::ToolRegistry::from_tools([handler]),
+        Vec::new(),
+        codex_protocol::openai_models::ToolMode::Direct,
+        Default::default(),
+        None,
+        &[],
+    ));
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context =
+        StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
+    let tool_runtime = ToolCallRuntime::new(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+    );
+    (
+        HandleOutputCtx {
+            sess: session,
+            step_context,
+            turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+            tool_runtime,
+            defer_tool_dispatch: false,
+            cancellation_token: CancellationToken::new(),
+        },
+        probe,
+    )
+}
+
+fn call_with_status(custom: bool, call_id: &str, status: Option<&str>) -> ResponseItem {
+    let mut item = if custom {
+        json!({"type": "custom_tool_call", "name": "record_effect", "input": "record", "call_id": call_id})
+    } else {
+        json!({"type": "function_call", "name": "record_effect", "arguments": "{\"value\":\"record\"}", "call_id": call_id})
+    };
+    if let Some(status) = status {
+        item["status"] = json!(status);
+    }
+    serde_json::from_value(item).expect("tool call")
+}
+
+#[test_case::test_case(false, false, false; "function")]
+#[test_case::test_case(true, false, false; "custom")]
+#[test_case::test_case(false, true, false; "function_cancelled")]
+#[test_case::test_case(true, true, false; "custom_cancelled")]
+#[test_case::test_case(false, false, true; "function_deferred")]
+#[test_case::test_case(true, false, true; "custom_deferred")]
+#[tokio::test]
+async fn incomplete_calls_are_not_admitted(custom: bool, cancelled: bool, deferred: bool) {
+    let (mut ctx, probe) = incomplete_call_context(custom, false).await;
+    ctx.defer_tool_dispatch = deferred;
+    if cancelled {
+        ctx.cancellation_token.cancel();
+    }
+    let result = handle_output_item_done(
+        &mut ctx,
+        call_with_status(custom, "incomplete", Some("incomplete")),
+        None,
+    )
+    .await
+    .expect("incomplete item handled");
+    assert!(result.needs_follow_up);
+    assert!(result.tool_future.is_none());
+    assert_eq!(
+        probe.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(probe.handled.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let history = ctx.sess.clone_history().await;
+    let items = history.raw_items().collect::<Vec<_>>();
+    assert_eq!(items.len(), 2);
+    let original = serde_json::to_value(items[0]).expect("original item");
+    assert_eq!(original["status"], "incomplete");
+    assert_eq!(original["call_id"], "incomplete");
+    let (call_id, output) = match items[1] {
+        ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } if custom => (call_id.as_str(), output),
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            output,
+            ..
+        } if !custom => (call_id.as_str(), output),
+        other => panic!("incorrect output type: {other:?}"),
+    };
+    assert_eq!(call_id, "incomplete");
+    assert_eq!(output.success, Some(false));
+    assert_eq!(
+        output.text_content(),
+        Some("Tool call was not executed because its model output was incomplete.")
+    );
+}
+
+#[test_case::test_case(false, None; "function_omitted")]
+#[test_case::test_case(true, None; "custom_omitted")]
+#[test_case::test_case(false, Some("completed"); "function_completed")]
+#[test_case::test_case(true, Some("completed"); "custom_completed")]
+#[tokio::test]
+async fn incomplete_guard_preserves_compatible_calls(custom: bool, status: Option<&str>) {
+    let (mut ctx, probe) = incomplete_call_context(custom, false).await;
+    let result =
+        handle_output_item_done(&mut ctx, call_with_status(custom, "accepted", status), None)
+            .await
+            .expect("accepted item");
+    let response = result
+        .tool_future
+        .expect("admitted tool")
+        .await
+        .expect("tool result");
+    assert_eq!(
+        probe.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(probe.handled.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let output = match response.item {
+        ResponseItem::CustomToolCallOutput { output, .. } if custom => output,
+        ResponseItem::FunctionCallOutput { output, .. } if !custom => output,
+        other => panic!("incorrect output type: {other:?}"),
+    };
+    assert_eq!(output.text_content(), Some("effect recorded"));
+}
+
+#[test_case::test_case(false; "function")]
+#[test_case::test_case(true; "custom")]
+#[tokio::test]
+async fn incomplete_guard_leaves_prior_running_call_intact(custom: bool) {
+    let (mut ctx, probe) = incomplete_call_context(custom, true).await;
+    let completed = handle_output_item_done(
+        &mut ctx,
+        call_with_status(custom, "accepted", Some("completed")),
+        None,
+    )
+    .await
+    .expect("accepted item")
+    .tool_future
+    .expect("admitted tool");
+    tokio::time::timeout(std::time::Duration::from_secs(5), probe.started.notified())
+        .await
+        .expect("accepted handler started before next item");
+    let rejected = handle_output_item_done(
+        &mut ctx,
+        call_with_status(custom, "rejected", Some("incomplete")),
+        None,
+    )
+    .await
+    .expect("incomplete item");
+    assert!(rejected.tool_future.is_none());
+    assert!(!ctx.cancellation_token.is_cancelled());
+    probe.release.notify_one();
+    let response = completed.await.expect("prior call completes");
+    assert_eq!(
+        probe.dispatched.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(probe.handled.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let output = match response.item {
+        ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } if custom => {
+            assert_eq!(call_id, "accepted");
+            output
+        }
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } if !custom => {
+            assert_eq!(call_id.as_deref(), Some("accepted"));
+            output
+        }
+        other => panic!("incorrect output type: {other:?}"),
+    };
+    assert_eq!(output.text_content(), Some("effect recorded"));
+}
+
 fn assistant_output_text(text: &str) -> ResponseItem {
     assistant_output_text_with_phase(text, /*phase*/ None)
 }

@@ -322,6 +322,24 @@ pub(crate) async fn handle_output_item_done(
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.step_context.turn.mode() == ModeKind::Plan;
 
+    if let Some(response) = incomplete_tool_call_response(&item) {
+        ctx.sess
+            .services
+            .executed_tool_calls
+            .observe_non_dispatched_call(&item);
+        // An item-done event can finalize an incomplete call. Keep its disposition
+        // alongside the original call without admitting any tool execution.
+        ctx.sess
+            .record_conversation_items(
+                &ctx.step_context.turn,
+                &ctx.step_context.settings.model_info,
+                &[item, response],
+            )
+            .await;
+        output.needs_follow_up = true;
+        return Ok(output);
+    }
+
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
@@ -443,6 +461,39 @@ pub(crate) async fn handle_output_item_done(
     }
 
     Ok(output)
+}
+
+fn incomplete_tool_call_response(item: &ResponseItem) -> Option<ResponseItem> {
+    let payload = || FunctionCallOutputPayload {
+        body: FunctionCallOutputBody::Text(
+            "Tool call was not executed because its model output was incomplete.".to_string(),
+        ),
+        success: Some(false),
+    };
+    match item {
+        ResponseItem::FunctionCall {
+            status: Some(status),
+            call_id,
+            ..
+        } if status == "incomplete" => {
+            response_input_to_response_item(&ResponseInputItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: payload(),
+            })
+        }
+        ResponseItem::CustomToolCall {
+            status: Some(status),
+            call_id,
+            ..
+        } if status == "incomplete" => {
+            response_input_to_response_item(&ResponseInputItem::CustomToolCallOutput {
+                call_id: call_id.clone(),
+                name: None,
+                output: payload(),
+            })
+        }
+        _ => None,
+    }
 }
 
 pub(crate) async fn handle_non_tool_response_item(

@@ -104,6 +104,91 @@ async fn dispatch_and_timing_surround_tool_execution(
     Ok(())
 }
 
+#[test_case(false, true; "function_terminal_incomplete")]
+#[test_case(true, true; "custom_terminal_incomplete")]
+#[test_case(false, false; "function_completed_response")]
+#[test_case(true, false; "custom_completed_response")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_item_never_dispatches_and_terminal_response_never_retries(
+    custom: bool,
+    terminal_incomplete: bool,
+) -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let item = if custom {
+        json!({"type": "custom_tool_call", "call_id": "rejected", "name": "exec",
+            "input": "text(await tools.update_plan({plan: []}));", "status": "incomplete"})
+    } else {
+        json!({"type": "function_call", "call_id": "rejected", "name": "update_plan",
+            "arguments": "{\"plan\":[]}", "status": "incomplete"})
+    };
+    let terminal = if terminal_incomplete {
+        json!({"type": "response.incomplete", "response": {"id": "first",
+            "incomplete_details": {"reason": "max_output_tokens"}}})
+    } else {
+        responses::ev_completed("first")
+    };
+    let mut bodies = vec![responses::sse(vec![
+        responses::ev_response_created("first"),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+        terminal,
+    ])];
+    if !terminal_incomplete {
+        bodies.push(responses::sse(vec![
+            responses::ev_assistant_message("answer", "done"),
+            responses::ev_completed("last"),
+        ]));
+    }
+    let requests = responses::mount_sse_sequence(&server, bodies).await;
+    let observations = Arc::new(Observations::default());
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.tool_lifecycle_contributor(observations.clone());
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| {
+            config.update_plan_enabled = true;
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("enable code mode");
+            config.model_provider.stream_max_retries = Some(2);
+            config.model_provider.request_max_retries = Some(0);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "update the plan".into(),
+            text_elements: vec![],
+        }]))
+        .await?;
+    let mut errors = Vec::new();
+    wait_for_event(&test.codex, |event| {
+        match event {
+            EventMsg::Error(error) => errors.push(error.message.clone()),
+            EventMsg::PlanUpdate(_) | EventMsg::StreamError(_) => {
+                panic!("unexpected event: {event:?}")
+            }
+            _ => {}
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        errors,
+        if terminal_incomplete {
+            vec!["Incomplete response returned, reason: max_output_tokens".to_string()]
+        } else {
+            vec![]
+        }
+    );
+    assert_eq!(
+        requests.requests().len(),
+        if terminal_incomplete { 1 } else { 2 }
+    );
+    assert!(observations.events.lock().expect("observations").is_empty());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_tool_still_reports_handler_timing() -> Result<()> {
     let server = responses::start_mock_server().await;
